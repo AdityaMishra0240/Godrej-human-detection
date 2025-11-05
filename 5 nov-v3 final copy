@@ -1,0 +1,49 @@
+import cv2, mediapipe as mp, lgpio, time
+
+# GPIO
+CHIP, PIN = 0, 27
+h = lgpio.gpiochip_open(CHIP)
+lgpio.gpio_claim_output(h, PIN)
+
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=0,
+    smooth_landmarks=True,
+    enable_segmentation=False,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.5
+)
+
+cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_FPS, 30)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(frame_rgb)
+
+        if results.pose_landmarks:
+            text, color = "Human Detected", (0,255,0)
+            lgpio.gpio_write(h, PIN, 1)
+        else:
+            text, color = "No Human", (0,0,255)
+            lgpio.gpio_write(h, PIN, 0)
+
+        cv2.putText(frame, text, (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        cv2.imshow("Human Detection", frame)
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+finally:
+    lgpio.gpio_write(h, PIN, 0)
+    lgpio.gpiochip_close(h)
+    cap.release()
+    cv2.destroyAllWindows()
