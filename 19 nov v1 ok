@@ -1,0 +1,196 @@
+import torch
+import cv2
+import lgpio
+import numpy as np
+import os
+import json
+import time
+from flask import Flask, Response
+import threading
+
+# ---------------- GPIO Setup (Raspberry Pi 5 Compatible) ----------------
+GPIO_PIN = 27
+chip = lgpio.gpiochip_open(0)
+lgpio.gpio_claim_output(chip, GPIO_PIN)
+lgpio.gpio_write(chip, GPIO_PIN, 1)   # HIGH = no human detected
+print("✅ GPIO 27 initialized using lgpio (HIGH = no human detected)")
+
+# ---------------- YOLOv5 Setup ----------------
+model = torch.hub.load('ultralytics/yolov5', 'yolov5n', pretrained=True)
+model.conf = 0.4
+print("✅ YOLOv5n model loaded on CPU")
+
+# ---------------- Flask Web Stream Setup ----------------
+app = Flask(__name__)
+output_frame = None
+lock = threading.Lock()
+
+def generate():
+    global output_frame
+    while True:
+        with lock:
+            if output_frame is None:
+                continue
+            (flag, encoded) = cv2.imencode(".jpg", output_frame)
+            if not flag:
+                continue
+
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
+               bytearray(encoded) + b'\r\n')
+
+@app.route("/video")
+def video_feed():
+    return Response(generate(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+threading.Thread(target=lambda: app.run(
+    host="0.0.0.0", port=8080, debug=False, threaded=True
+), daemon=True).start()
+
+print("🌐 Stream started at: http://<pi_ip>:8080/video")
+
+# ---------------- Geofence Save/Load ----------------
+FENCE_FILE = "/home/root1/fence.json"
+
+def save_fence(points):
+    try:
+        with open(FENCE_FILE, "w") as f:
+            json.dump(points, f)
+        print("💾 Fence saved.")
+    except Exception as e:
+        print("⚠️ Save error:", e)
+
+def load_fence():
+    if os.path.exists(FENCE_FILE):
+        try:
+            with open(FENCE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return []
+
+# ---------------- Fence & Camera Setup ----------------
+drawing = False
+fence_points = load_fence()
+temp_points = []
+
+cap = cv2.VideoCapture(0)
+cap.set(3, 640)
+cap.set(4, 480)
+
+if not cap.isOpened():
+    print("❌ Camera not opened")
+    lgpio.gpiochip_close(chip)
+    exit()
+
+print("🎥 Camera ready. Press f=draw, Enter=save, r=reset, q=quit")
+
+def mouse_callback(event, x, y, flags, param):
+    global drawing, temp_points
+    if drawing and event == cv2.EVENT_LBUTTONDOWN:
+        temp_points.append((x, y))
+        print("🟣 Point:", x, y)
+
+cv2.namedWindow("YOLOv5 Human Detection")
+cv2.setMouseCallback("YOLOv5 Human Detection", mouse_callback)
+
+# ---------------- Main Loop ----------------
+try:
+    frame_count = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("⚠️ Frame lost")
+            break
+
+        frame_count += 1
+
+        # Skip alternate frames
+        if frame_count % 2 != 0:
+            with lock:
+                output_frame = frame.copy()
+            continue
+
+        # Draw fence
+        if len(fence_points) > 1:
+            cv2.polylines(frame, [np.array(fence_points)], True, (255, 0, 255), 2)
+            for p in fence_points:
+                cv2.circle(frame, p, 4, (255, 0, 255), -1)
+
+        if drawing and len(temp_points) > 1:
+            cv2.polylines(frame, [np.array(temp_points)], False, (255, 0, 255), 2)
+
+        # YOLO
+        results = model(frame)
+        df = results.pandas().xyxy[0]
+        humans = df[df["name"] == "person"]
+
+        count = 0
+
+        for _, row in humans.iterrows():
+            x1, y1, x2, y2 = map(int, [row.xmin, row.ymin, row.xmax, row.ymax])
+            cx, cy = (x1 + x2)//2, (y1 + y2)//2
+
+            inside = False
+
+            if len(fence_points) > 2:
+                fence = np.array(fence_points)
+
+                # Check center
+                if cv2.pointPolygonTest(fence, (cx, cy), False) >= 0:
+                    inside = True
+
+                # Check all corners
+                corners = [(x1,y1),(x2,y1),(x1,y2),(x2,y2)]
+                for c in corners:
+                    if cv2.pointPolygonTest(fence, c, False) >= 0:
+                        inside = True
+                        break
+
+            if inside:
+                count += 1
+                # RED
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,0,255), 2)
+                cv2.putText(frame,"Inside Fence",(x1,y1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
+            else:
+                # GREEN
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+
+        detected = count > 0
+        current_state = 0 if detected else 1   # LOW instantly if detected
+
+        # ---------------- INSTANT OUTPUT (NO DELAY) ----------------
+        lgpio.gpio_write(chip, GPIO_PIN, current_state)
+
+        cv2.putText(frame, f"Humans Inside: {count}", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 2)
+
+        with lock:
+            output_frame = frame.copy()
+
+        cv2.imshow("YOLOv5 Human Detection", frame)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("f"):
+            drawing = True
+            temp_points = []
+        elif key == 13 and drawing:
+            fence_points = temp_points.copy()
+            drawing = False
+            save_fence(fence_points)
+        elif key == ord("r"):
+            fence_points = []
+            temp_points = []
+            drawing = False
+            save_fence([])
+        elif key == ord("q"):
+            break
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    lgpio.gpio_write(chip, GPIO_PIN, 1)
+    lgpio.gpiochip_close(chip)
+    print("⚙️ Exit complete")
