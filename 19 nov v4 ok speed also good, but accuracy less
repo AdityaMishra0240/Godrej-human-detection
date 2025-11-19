@@ -1,0 +1,278 @@
+import cv2
+import numpy as np
+import os
+import json
+import threading
+from flask import Flask, Response
+
+# ---------------- GPIO ----------------
+try:
+    import lgpio
+    GPIO_AVAILABLE = True
+except:
+    GPIO_AVAILABLE = False
+    print("⚠️ lgpio missing")
+
+GPIO_PIN = 27
+chip = None
+if GPIO_AVAILABLE:
+    try:
+        chip = lgpio.gpiochip_open(0)
+        lgpio.gpio_claim_output(chip, GPIO_PIN)
+        lgpio.gpio_write(chip, GPIO_PIN, 1)
+        print("✅ GPIO ready (HIGH = no person)")
+    except Exception as e:
+        print("⚠️ GPIO error:", e)
+        chip = None
+
+# ---------------- TFLITE SSD MODEL ----------------
+from tflite_runtime.interpreter import Interpreter
+
+MODEL_PATH = os.path.expanduser("~/tflite_models/efficientdet_lite0.tflite")
+if not os.path.exists(MODEL_PATH):
+    print("❌ Model missing:", MODEL_PATH)
+    exit()
+
+interpreter = Interpreter(MODEL_PATH, num_threads=4)
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+INPUT_W = 300
+INPUT_H = 300
+
+print("✅ MobileNet-SSD (TFLite) loaded")
+
+# ---------------- ENSEMBLE VALIDATORS ----------------
+hog = cv2.HOGDescriptor()
+hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+
+bg_sub = cv2.createBackgroundSubtractorMOG2(history=200, varThreshold=25, detectShadows=False)
+
+def run_ssd_raw(frame, conf_thresh=0.40):
+    h, w = frame.shape[:2]
+    img = cv2.resize(frame, (INPUT_W, INPUT_H))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    inp = np.expand_dims(img, 0).astype(np.uint8)
+
+    interpreter.set_tensor(input_details[0]['index'], inp)
+    interpreter.invoke()
+
+    boxes = interpreter.get_tensor(output_details[0]['index'])[0]
+    classes = interpreter.get_tensor(output_details[1]['index'])[0]
+    scores = interpreter.get_tensor(output_details[2]['index'])[0]
+
+    results = []
+    for i in range(len(scores)):
+        if scores[i] < conf_thresh:
+            continue
+        if int(classes[i]) != 0:   # 0 = person
+            continue
+
+        ymin, xmin, ymax, xmax = boxes[i]
+        x1, y1 = int(xmin*w), int(ymin*h)
+        x2, y2 = int(xmax*w), int(ymax*h)
+        x1, y1 = max(0,x1), max(0,y1)
+        x2, y2 = min(w-1,x2), min(h-1,y2)
+
+        results.append((x1, y1, x2, y2, float(scores[i])))
+
+    return results
+
+def hog_confirm(frame, box):
+    x1, y1, x2, y2 = box
+    pad = 8
+    xa = max(0, x1-pad)
+    ya = max(0, y1-pad)
+    xb = min(frame.shape[1], x2+pad)
+    yb = min(frame.shape[0], y2+pad)
+    roi = frame[ya:yb, xa:xb]
+    if roi.size == 0:
+        return False
+
+    scale = 256 / max(roi.shape[1], 64)
+    if scale > 1:
+        roi_resized = cv2.resize(roi, (int(roi.shape[1]*scale), int(roi.shape[0]*scale)))
+    else:
+        roi_resized = roi
+
+    rects, weights = hog.detectMultiScale(roi_resized, winStride=(8,8),
+                                          padding=(8,8), scale=1.05)
+
+    return any(wt > 0.5 for wt in weights)
+
+def motion_confirm(frame, box, motion_thresh=0.02):
+    x1, y1, x2, y2 = box
+    xa = max(0, x1)
+    ya = max(0, y1)
+    xb = min(frame.shape[1], x2)
+    yb = min(frame.shape[0], y2)
+    roi = frame[ya:yb, xa:xb]
+    if roi.size == 0:
+        return False
+
+    mask = bg_sub.apply(roi)
+    fg = (mask > 200).astype(np.uint8)
+    frac = fg.sum() / (fg.size + 1e-6)
+
+    return frac >= motion_thresh
+
+# ---------------- Flask Stream ----------------
+app = Flask(__name__)
+output_frame = None
+lock = threading.Lock()
+
+def generate():
+    global output_frame
+    while True:
+        with lock:
+            if output_frame is None:
+                continue
+            ok, enc = cv2.imencode(".jpg", output_frame)
+            if not ok:
+                continue
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
+               bytearray(enc) + b"\r\n")
+
+@app.route("/video")
+def video_feed():
+    return Response(generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame")
+
+threading.Thread(target=lambda: app.run(host="0.0.0.0",
+    port=8080, debug=False, threaded=True),
+    daemon=True).start()
+
+print("🌐 Stream: http://<PI_IP>:8080/video")
+
+# ---------------- Fence File ----------------
+FENCE_FILE = os.path.expanduser("~/fence.json")
+
+def save_fence(points):
+    try:
+        with open(FENCE_FILE, "w") as f:
+            json.dump(points, f)
+    except:
+        print("⚠️ Fence save error")
+
+def load_fence():
+    if os.path.exists(FENCE_FILE):
+        try:
+            with open(FENCE_FILE) as f:
+                return json.load(f)
+        except:
+            pass
+    return []
+
+# ---------------- Camera + Fence ----------------
+fence_points = load_fence()
+temp_points = []
+drawing = False
+
+cap = cv2.VideoCapture(0)
+cap.set(3, 640)
+cap.set(4, 480)
+
+if not cap.isOpened():
+    print("❌ Camera error")
+    exit()
+
+cv2.namedWindow("Human Detection")
+def mouse_callback(event, x, y, flags, param):
+    global drawing
+    if drawing and event == cv2.EVENT_LBUTTONDOWN:
+        temp_points.append((x,y))
+cv2.setMouseCallback("Human Detection", mouse_callback)
+
+print("🎥 f=draw, Enter=save, r=reset, q=quit")
+
+# ---------------- MAIN LOOP ----------------
+try:
+    frame_count = 0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok: continue
+
+        frame_count += 1
+
+        # Skip frames for speed
+        if frame_count % 2 != 0:
+            with lock: output_frame = frame.copy()
+            continue
+
+        # Draw fences
+        if len(fence_points) > 1:
+            cv2.polylines(frame, [np.array(fence_points)], True, (255,0,255), 2)
+        if drawing and len(temp_points) > 1:
+            cv2.polylines(frame, [np.array(temp_points)], False, (255,0,255), 2)
+
+        # -------- DETECTION --------
+        raw_dets = run_ssd_raw(frame, conf_thresh=0.38)
+        validated = []
+
+        for (x1, y1, x2, y2, score) in raw_dets:
+            if (x2-x1) < 40 or (y2-y1) < 80:
+                continue
+
+            hog_ok = hog_confirm(frame, (x1,y1,x2,y2))
+            motion_ok = motion_confirm(frame, (x1,y1,x2,y2))
+
+            if hog_ok or motion_ok:
+                validated.append((x1,y1,x2,y2))
+
+        count = 0
+
+        for (x1,y1,x2,y2) in validated:
+            cx, cy = (x1+x2)//2, (y1+y2)//2
+            inside = False
+
+            if len(fence_points) > 2:
+                poly = np.array(fence_points)
+
+                if cv2.pointPolygonTest(poly, (cx,cy), False) >= 0:
+                    inside = True
+
+                for p in [(x1,y1),(x2,y1),(x1,y2),(x2,y2)]:
+                    if cv2.pointPolygonTest(poly, p, False) >= 0:
+                        inside = True
+                        break
+
+            if inside:
+                count += 1
+                cv2.rectangle(frame, (x1,y1),(x2,y2), (0,0,255),2)
+            else:
+                cv2.rectangle(frame, (x1,y1),(x2,y2), (0,255,0),2)
+
+        if GPIO_AVAILABLE and chip:
+            lgpio.gpio_write(chip, GPIO_PIN, 0 if count>0 else 1)
+
+        cv2.putText(frame, f"Humans: {count}", (10,40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255),2)
+
+        with lock: output_frame = frame.copy()
+        cv2.imshow("Human Detection", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("f"):
+            drawing = True
+            temp_points = []
+        elif key == 13 and drawing:
+            fence_points = temp_points.copy()
+            drawing = False
+            save_fence(fence_points)
+        elif key == ord("r"):
+            fence_points = []
+            temp_points = []
+            drawing = False
+            save_fence([])
+        elif key == ord("q"):
+            break
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    if GPIO_AVAILABLE and chip:
+        lgpio.gpio_write(chip, GPIO_PIN, 1)
+        lgpio.gpiochip_close(chip)
+    print("⚙️ Exit complete")
